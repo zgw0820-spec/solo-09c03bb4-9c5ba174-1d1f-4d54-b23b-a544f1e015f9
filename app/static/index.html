@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RPC 双程耗时分析</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         background: #f4f6f8; color: #1f2933; }
+  header { background: #16324f; color: #fff; padding: 18px 28px; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0; font-size: 13px; color: #b8c7d9; }
+  main { max-width: 980px; margin: 20px auto 48px; padding: 0 16px; }
+  .card { background: #fff; border: 1px solid #dde3ea; border-radius: 8px;
+          padding: 18px 20px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 16px; }
+  label { display: block; font-size: 13px; color: #52606d; margin-bottom: 6px; }
+  input[type=number] { width: 180px; padding: 7px 9px; border: 1px solid #cbd2d9;
+                       border-radius: 6px; font-size: 14px; }
+  textarea { width: 100%; margin-top: 10px; padding: 9px; border: 1px solid #cbd2d9;
+             border-radius: 6px; font-family: ui-monospace, Consolas, monospace;
+             font-size: 12.5px; line-height: 1.5; resize: vertical; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 10px; }
+  button { padding: 8px 16px; border: 0; border-radius: 6px; font-size: 14px;
+           cursor: pointer; background: #e4e7eb; color: #1f2933; }
+  button:hover { filter: brightness(0.95); }
+  button.primary { background: #2563eb; color: #fff; }
+  .hint { font-size: 12px; color: #7b8794; margin: 8px 0 0; }
+  .banner { border-radius: 8px; padding: 14px 18px; margin-bottom: 16px; font-size: 15px; }
+  .banner.ok { background: #e3f2e5; border: 1px solid #7bc47f; color: #1b5e20; }
+  .banner.warn { background: #fff4e0; border: 1px solid #f0b429; color: #8a4b00; }
+  .banner.err { background: #fde8e8; border: 1px solid #f05252; color: #9b1c1c; }
+  .banner b { font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 6px; }
+  th, td { border: 1px solid #e4e7eb; padding: 6px 10px; text-align: left; }
+  th { background: #f0f4f8; font-weight: 600; }
+  td.num, th.num { text-align: right; font-family: ui-monospace, Consolas, monospace; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
+         background: #fde8e8; color: #9b1c1c; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  ul.steps { margin: 8px 0 0; padding-left: 20px; font-size: 13px; }
+  details { font-size: 13px; color: #52606d; }
+  details summary { cursor: pointer; font-weight: 600; color: #1f2933; }
+  details p, details li { line-height: 1.7; }
+  code { background: #f0f4f8; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RPC 双程耗时分析</h1>
+  <p>内网 RPC 变慢时，判断该查请求去程还是应答回程：同一短窗口的一批调用 + 各机固定未知钟差 ⇒ 逐笔两程可达范围与整体达标判定</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 填写参数</h2>
+    <div class="row">
+      <div>
+        <label for="limit">单程耗时上限（微秒，整数）</label>
+        <input id="limit" type="number" min="0" step="1" value="200">
+      </div>
+      <div>
+        <label>上传调用 CSV（每批 ≤ 80 笔、≤ 16 台主机）</label>
+        <input id="file" type="file" accept=".csv,text/csv">
+      </div>
+      <button id="sample-ok" type="button">载入试算样例</button>
+      <button id="sample-bad" type="button">载入矛盾样例</button>
+    </div>
+    <textarea id="csv" rows="9" spellcheck="false" placeholder="call_id,caller,callee,req_send,req_recv,resp_send,resp_recv"></textarea>
+    <p class="hint">
+      CSV 列：<span class="mono">call_id,caller,callee,req_send,req_recv,resp_send,resp_recv</span>，
+      即调用号、调用方主机名、服务方主机名、请求发出、请求到达、应答发出、应答到达。
+      四个时刻为整数微秒，各按所在主机自身的时钟记录；同一主机的钟差在整批内固定，两程耗时均须非负。
+      试算：样例上限填 <b>200</b> 时无法同时达标（可求出最小可行上限），填 <b>250</b> 时全部达标。
+    </p>
+    <div class="row" style="margin-top:12px">
+      <button id="run" class="primary" type="button">开始分析</button>
+    </div>
+  </section>
+
+  <section id="verdict"></section>
+  <section id="detail"></section>
+
+  <section class="card">
+    <details>
+      <summary>方法说明（模型与假设）</summary>
+      <p>设主机 h 的钟差为 o[h]（本地钟读数 = 真实时刻 + o[h]，本批内固定）。一笔调用方 a → 服务方 b 的记录
+      (t1 请求发出, t2 请求到达, t3 应答发出, t4 应答到达) 给出：</p>
+      <ul>
+        <li>去程耗时 = (t2 − t1) − (o[b] − o[a]) ≥ 0</li>
+        <li>回程耗时 = (t4 − t3) + (o[b] − o[a]) ≥ 0</li>
+      </ul>
+      <p>所有约束都是差分约束：用 Bellman-Ford 判定可行并求一组整数钟差；逐笔可达范围来自全源最短路
+      （Floyd-Warshall）给出的 o[b] − o[a] 上下界；记录自洽但无法同时达标时，二分求出能解释这批记录的最小整数微秒上限，
+      并给出一套满足该上限的钟差及对应逐笔耗时。约束链出现负环（如某笔记录的两程无法同时非负）即判定记录彼此矛盾，提示复测。</p>
+      <p>说明：模型只假设“钟差固定 + 两程非负”，不假设处理耗时（t3 − t2）非负等额外约束；钟差整体平移不改变耗时，页面展示的钟差已把最小值归零。</p>
+    </details>
+  </section>
+</main>
+<script>
+const SAMPLE_OK = `call_id,caller,callee,req_send,req_recv,resp_send,resp_recv
+c1,web1,app1,1000000,1000620,1000700,1000350
+c2,app1,db1,1000650,999930,1000000,1000920
+c3,web1,db1,1000500,1000400,1000500,1001050
+`;
+const SAMPLE_BAD = `call_id,caller,callee,req_send,req_recv,resp_send,resp_recv
+x1,web1,app1,1000000,1000100,1000400,1000200
+`;
+
+const $ = (id) => document.getElementById(id);
+const csvEl = $("csv"), limitEl = $("limit");
+
+$("sample-ok").onclick = () => { csvEl.value = SAMPLE_OK; limitEl.value = 200; };
+$("sample-bad").onclick = () => { csvEl.value = SAMPLE_BAD; limitEl.value = 200; };
+$("file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => { csvEl.value = reader.result; };
+  reader.readAsText(f);
+});
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function banner(kind, html) {
+  return `<div class="banner ${kind}">${html}</div>`;
+}
+
+$("run").onclick = async () => {
+  $("verdict").innerHTML = "";
+  $("detail").innerHTML = "";
+  const limit = Number(limitEl.value);
+  if (!Number.isInteger(limit) || limit < 0) {
+    $("verdict").innerHTML = banner("err", "<b>输入有误：</b>单程耗时上限必须是非负整数（微秒）。");
+    return;
+  }
+  let data;
+  try {
+    const resp = await fetch("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit_us: limit, csv_text: csvEl.value }),
+    });
+    data = await resp.json();
+  } catch (err) {
+    $("verdict").innerHTML = banner("err", `<b>请求失败：</b>${esc(err)}`);
+    return;
+  }
+  if (!data.ok) {
+    $("verdict").innerHTML = banner("err", `<b>输入有误：</b>${esc(data.error)}`);
+    return;
+  }
+  render(data.result);
+};
+
+function render(r) {
+  let v = "", d = "";
+  if (!r.consistent) {
+    v = banner("err", `<b>记录彼此矛盾，请复测。</b>以下约束无法同时成立（合计 ${r.contradiction.total_us} µs &lt; 0）：`);
+    d += `<div class="card"><h2>矛盾约束链</h2><ul class="steps">` +
+      r.contradiction.steps.map((s) => `<li class="mono">${esc(s)}</li>`).join("") +
+      `</ul></div>`;
+    $("verdict").innerHTML = v;
+    $("detail").innerHTML = d;
+    return;
+  }
+
+  if (r.feasible_with_limit) {
+    v = banner("ok", `<b>全部达标：</b>存在一组钟差使所有 ${r.calls.length} 笔调用的去程与回程同时 ≤ 上限 ${r.limit_us} µs。`);
+  } else {
+    v = banner("warn", `<b>无法同时达标：</b>记录自洽，但不存在使所有调用两程同时 ≤ ${r.limit_us} µs 的钟差；` +
+      `能解释这批记录的最小整数上限为 <b>${r.min_limit_us} µs</b>（下表给出一套满足该上限的钟差与逐笔耗时）。`);
+  }
+
+  d += `<div class="card"><h2>逐笔可达范围（仅基于“钟差固定 + 两程非负”）</h2>`;
+  d += `<table><thead><tr><th>调用号</th><th>方向</th>` +
+    `<th class="num">去程可达范围 (µs)</th><th class="num">回程可达范围 (µs)</th><th>备注</th></tr></thead><tbody>`;
+  for (const c of r.calls) {
+    d += `<tr><td>${esc(c.call_id)}</td><td>${esc(c.caller)} → ${esc(c.callee)}</td>` +
+      `<td class="num">[${c.out_min}, ${c.out_max}]</td>` +
+      `<td class="num">[${c.ret_min}, ${c.ret_max}]</td>` +
+      `<td>${c.must_exceed ? '<span class="tag">该笔必然超限</span>' : ""}</td></tr>`;
+  }
+  d += `</tbody></table></div>`;
+
+  d += `<div class="card"><h2>一组可行钟差（${esc(r.assignment_note)}，最小值已归零）</h2>`;
+  d += `<table><thead><tr><th>主机</th><th class="num">相对钟差 o (µs)</th></tr></thead><tbody>`;
+  for (const h of r.hosts) {
+    d += `<tr><td>${esc(h)}</td><td class="num">${r.offsets[h]}</td></tr>`;
+  }
+  d += `</tbody></table>`;
+  d += `<h2 style="margin-top:16px">该组钟差下的逐笔耗时</h2>`;
+  d += `<table><thead><tr><th>调用号</th><th>方向</th>` +
+    `<th class="num">去程 (µs)</th><th class="num">回程 (µs)</th></tr></thead><tbody>`;
+  for (const a of r.assignment) {
+    d += `<tr><td>${esc(a.call_id)}</td><td>${esc(a.caller)} → ${esc(a.callee)}</td>` +
+      `<td class="num">${a.out_us}</td><td class="num">${a.ret_us}</td></tr>`;
+  }
+  d += `</tbody></table></div>`;
+
+  $("verdict").innerHTML = v;
+  $("detail").innerHTML = d;
+}
+</script>
+</body>
+</html>

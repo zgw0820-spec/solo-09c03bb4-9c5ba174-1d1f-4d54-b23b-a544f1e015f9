@@ -1,0 +1,8 @@
+services:
+  rpc-latency-web:
+    build: .
+    image: rpc-latency-web:latest
+    container_name: rpc-latency-web
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
