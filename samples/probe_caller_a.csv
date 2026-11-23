@@ -1,0 +1,4 @@
+call_id,role,host,req_ts,resp_ts
+c1,caller,web1,1000000,1001350
+c2,caller,app1,1000650,1001920
+c3,caller,web1,1000500,1002050

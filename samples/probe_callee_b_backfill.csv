@@ -1,0 +1,2 @@
+call_id,role,host,req_ts,resp_ts
+c2,callee,db1,999930,1000000

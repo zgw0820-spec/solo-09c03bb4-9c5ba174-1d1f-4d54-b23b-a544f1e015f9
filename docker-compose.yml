@@ -5,4 +5,7 @@ services:
     container_name: rpc-latency-web
     ports:
       - "8000:8000"
+    environment:
+      # 后台分析人工延迟（毫秒），用于演示“旧回包晚到被丢弃”；0 表示关闭
+      RPC_ANALYSIS_DELAY_MS: "0"
     restart: unless-stopped

@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RPC 双端日志拼接</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         background: #f4f6f8; color: #1f2933; }
+  header { background: #16324f; color: #fff; padding: 18px 28px; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0; font-size: 13px; color: #b8c7d9; }
+  header a { color: #9fc3f0; }
+  main { max-width: 1100px; margin: 20px auto 48px; padding: 0 16px; }
+  .card { background: #fff; border: 1px solid #dde3ea; border-radius: 8px;
+          padding: 18px 20px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 16px; }
+  label { display: block; font-size: 13px; color: #52606d; margin-bottom: 6px; }
+  input[type=number] { width: 180px; padding: 7px 9px; border: 1px solid #cbd2d9;
+                       border-radius: 6px; font-size: 14px; }
+  input[type=file] { font-size: 13px; }
+  textarea { width: 100%; margin-top: 10px; padding: 9px; border: 1px solid #cbd2d9;
+             border-radius: 6px; font-family: ui-monospace, Consolas, monospace;
+             font-size: 12.5px; line-height: 1.5; resize: vertical; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 10px; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; font-size: 13.5px;
+           cursor: pointer; background: #e4e7eb; color: #1f2933; }
+  button:hover { filter: brightness(0.95); }
+  button.primary { background: #2563eb; color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hint { font-size: 12px; color: #7b8794; margin: 8px 0 0; line-height: 1.7; }
+  .banner { border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; font-size: 14px; }
+  .banner.ok { background: #e3f2e5; border: 1px solid #7bc47f; color: #1b5e20; }
+  .banner.warn { background: #fff4e0; border: 1px solid #f0b429; color: #8a4b00; }
+  .banner.err { background: #fde8e8; border: 1px solid #f05252; color: #9b1c1c; }
+  .banner.info { background: #e8f1fd; border: 1px solid #8ab4f8; color: #174ea6; }
+  .banner b { font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 6px; }
+  th, td { border: 1px solid #e4e7eb; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f4f8; font-weight: 600; }
+  td.num, th.num { text-align: right; font-family: ui-monospace, Consolas, monospace; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.red { background: #fde8e8; color: #9b1c1c; }
+  .tag.amber { background: #fff4e0; color: #8a4b00; }
+  .tag.green { background: #e3f2e5; color: #1b5e20; }
+  .tag.gray { background: #eef1f5; color: #52606d; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  ul.steps { margin: 8px 0 0; padding-left: 20px; font-size: 13px; }
+  code { background: #f0f4f8; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .cand { border: 1px solid #e4e7eb; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; }
+  .cand.sel { border-color: #2563eb; background: #f3f7ff; }
+  .cand label { display: flex; gap: 8px; align-items: flex-start; margin: 0; cursor: pointer; }
+  .src { font-size: 11.5px; color: #7b8794; margin-top: 3px; }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: #52606d; }
+  .stats b { color: #1f2933; font-size: 15px; }
+  .filelist { font-size: 12.5px; color: #52606d; margin: 6px 0 0; padding-left: 18px; }
+  .filelist li { margin-bottom: 2px; }
+  details { font-size: 13px; color: #52606d; }
+  details summary { cursor: pointer; font-weight: 600; color: #1f2933; }
+  details p, details li { line-height: 1.7; }
+  .demo-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RPC 双端日志拼接</h1>
+  <p>调用方 / 服务方探针分次上传同一短窗口的本端记录，按调用号配对、处理冲突候选，两端确定后送入
+     <a href="/">单程耗时分析</a>；用于分析的记录一变，旧结论立即撤下，晚回来的旧结果不会再显示。</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 上传探针 CSV（可分次、分端上传）</h2>
+    <div class="row">
+      <div>
+        <label>选择探针文件（文件名会作为候选来源展示）</label>
+        <input id="file" type="file" accept=".csv,text/csv">
+      </div>
+      <div class="demo-grid">
+        <button id="demo-caller" type="button">样例①调用方探针</button>
+        <button id="demo-callee" type="button">样例②服务方探针（缺 c2）</button>
+        <button id="demo-resend" type="button">样例③原样重传①</button>
+        <button id="demo-backfill" type="button">样例④补录 c2 服务方</button>
+        <button id="demo-conflict" type="button">样例⑤c1 调用方新候选</button>
+        <button id="demo-bad" type="button">样例⑥格式错误（应整份拒收）</button>
+      </div>
+    </div>
+    <textarea id="csv" rows="6" spellcheck="false"
+      placeholder="call_id,role,host,req_ts,resp_ts"></textarea>
+    <p class="hint">
+      CSV 列：<span class="mono">call_id,role,host,req_ts,resp_ts</span> —— 调用号、本端角色
+      （<code>caller</code> 调用方 / <code>callee</code> 服务方，也接受中文）、主机名、本端记录的请求时刻、应答时刻（整数微秒）。
+      任一行格式有误则<b>整份拒收</b>，本页已收记录不受影响。每批最多 80 个调用号、16 台主机、40 份文件。
+    </p>
+    <div class="row" style="margin-top:10px">
+      <input id="filename" type="hidden">
+      <button id="upload" class="primary" type="button">上传到当前批次</button>
+      <button id="reset" type="button">新建批次（清空）</button>
+      <span id="board-id" class="hint mono"></span>
+    </div>
+    <div id="upload-msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. 配对情况与候选选定</h2>
+    <div class="stats" id="stats"></div>
+    <ul class="filelist" id="filelist"></ul>
+    <table id="board-table">
+      <thead>
+        <tr><th style="width:90px">调用号</th><th>调用方端（请求发出 / 应答到达）</th>
+          <th>服务方端（请求到达 / 应答发出）</th><th style="width:150px">状态</th></tr>
+      </thead>
+      <tbody id="board-body"><tr><td colspan="4" class="hint">暂无记录，请先上传探针 CSV。</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>3. 单程分析（仅两端都确定的调用一起送入）</h2>
+    <div class="row">
+      <div>
+        <label for="limit">单程耗时上限（微秒，整数）</label>
+        <input id="limit" type="number" min="0" step="1" value="200">
+      </div>
+      <button id="run" class="primary" type="button">开始分析（后台执行）</button>
+      <span id="run-hint" class="hint"></span>
+    </div>
+    <div id="verdict"></div>
+  </section>
+
+  <section id="detail"></section>
+
+  <section class="card">
+    <details>
+      <summary>规则说明（配对、重选、结论失效）</summary>
+      <ul>
+        <li><b>配对：</b>按调用号把调用方端（req_ts=请求发出 t1、resp_ts=应答到达 t4）与服务方端
+          （req_ts=请求到达 t2、resp_ts=应答发出 t3）拼起来；缺哪一端页面明确标出。</li>
+        <li><b>冲突候选：</b>同一端收到内容不同的记录时全部保留并标注来源文件，由值班员单选；
+          来了新候选后该端选择作废、必须重选。内容完全相同的重传只增加来源、不算新候选，不需要重选。</li>
+        <li><b>分析输入：</b>只有两端都已确定的调用才会一起送入单程分析；输入内容带签名，
+          补录若没有改变这批记录（仅原样重传等），原结论照常保留。</li>
+        <li><b>结论失效：</b>选定记录一旦变化，页面立即撤下旧结论；后台分析按代次 + 输入签名对版，
+          晚回来的旧回包无法发布，前端也会丢弃过期响应。</li>
+      </ul>
+    </details>
+  </section>
+</main>
+<script>
+const DEMOS = {
+  "demo-caller": {
+    name: "probe_caller_a.csv",
+    text:
+`call_id,role,host,req_ts,resp_ts
+c1,caller,web1,1000000,1001350
+c2,caller,app1,1000650,1001920
+c3,caller,web1,1000500,1002050
+`
+  },
+  "demo-callee": {
+    name: "probe_callee_b.csv",
+    text:
+`call_id,role,host,req_ts,resp_ts
+c1,callee,app1,1000620,1000700
+c3,callee,db1,1000400,1000500
+`
+  },
+  "demo-resend": {
+    name: "probe_caller_a_retry.csv",
+    text:
+`call_id,role,host,req_ts,resp_ts
+c1,caller,web1,1000000,1001350
+c2,caller,app1,1000650,1001920
+c3,caller,web1,1000500,1002050
+`
+  },
+  "demo-backfill": {
+    name: "probe_callee_b_backfill.csv",
+    text:
+`call_id,role,host,req_ts,resp_ts
+c2,callee,db1,999930,1000000
+`
+  },
+  "demo-conflict": {
+    name: "probe_caller_a_v2.csv",
+    text:
+`call_id,role,host,req_ts,resp_ts
+c1,caller,web1,1000000,1001500
+`
+  },
+  "demo-bad": {
+    name: "probe_bad.csv",
+    text:
+`call_id,role,host,req_ts,resp_ts
+c9,caller,web1,十点半,1001350
+`
+  }
+};
+
+const $ = (id) => document.getElementById(id);
+const csvEl = $("csv"), fnameEl = $("filename"), limitEl = $("limit");
+let boardId = sessionStorage.getItem("rpc-stitch-board-id");
+let board = null;
+let pollTimer = null;
+// 前端请求代次：任何改变分析输入的动作都 +1，过期响应直接丢弃（双保险之一）
+let reqGen = 0;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+function banner(kind, html) { return `<div class="banner ${kind}">${html}</div>`; }
+function post(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(async (r) => ({ status: r.status, data: await r.json() }));
+}
+
+for (const [id, demo] of Object.entries(DEMOS)) {
+  $(id).onclick = () => { csvEl.value = demo.text; fnameEl.value = demo.name; };
+}
+$("file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  fnameEl.value = f.name;
+  const reader = new FileReader();
+  reader.onload = () => { csvEl.value = reader.result; };
+  reader.readAsText(f);
+});
+
+async function ensureBoard() {
+  if (boardId) {
+    const r = await fetch(`/api/stitch/boards/${boardId}`);
+    if (r.ok) { board = (await r.json()).board; return; }
+  }
+  const r = await post("/api/stitch/boards", {});
+  board = r.data.board;
+  boardId = board.board_id;
+  sessionStorage.setItem("rpc-stitch-board-id", boardId);
+}
+
+function invalidateView(reason) {
+  // 记录一变：前端立即撤下旧结论，不等服务器
+  reqGen++;
+  stopPolling();
+  $("verdict").innerHTML = banner("info",
+    `<b>旧结论已撤下：</b>${esc(reason)}。重新点击“开始分析”获取新结论。`);
+  $("detail").innerHTML = "";
+  $("run-hint").textContent = "";
+}
+
+$("reset").onclick = async () => {
+  sessionStorage.removeItem("rpc-stitch-board-id");
+  boardId = null;
+  board = null;
+  await ensureBoard();
+  reqGen++;
+  stopPolling();
+  $("verdict").innerHTML = "";
+  $("detail").innerHTML = "";
+  $("upload-msg").innerHTML = "";
+  renderBoard();
+};
+
+$("upload").onclick = async () => {
+  const myGen = reqGen;
+  const r = await post(`/api/stitch/boards/${boardId}/upload`, {
+    filename: fnameEl.value || "未命名.csv",
+    csv_text: csvEl.value,
+  });
+  if (myGen !== reqGen) return;  // 已被更新的动作取代
+  if (!r.data.ok) {
+    $("upload-msg").innerHTML = banner("err",
+      `<b>文件整份拒收，已收记录未改动：</b>${esc(r.data.error)}`);
+    return;
+  }
+  const s = r.data.summary;
+  board = r.data.board;
+  if (s.added_candidates > 0) {
+    invalidateView(`收到 ${s.added_candidates} 条新候选（代次 ${board.generation}），分析输入可能已变`);
+    $("upload-msg").innerHTML = banner("warn",
+      `<b>已接收 ${esc(s.filename)}：</b>${s.records} 行中含 ${s.added_candidates} 条新候选，` +
+      `相关调用需要重新选定；旧分析结论已撤下。`);
+  } else {
+    $("upload-msg").innerHTML = banner("ok",
+      `<b>已接收 ${esc(s.filename)}：</b>${s.records} 行均为已有记录（原样重传），没有新候选，` +
+      `分析输入未变，原结论照常保留。`);
+  }
+  renderBoard();
+};
+
+async function choose(callId, role, candidateId) {
+  const myGen = reqGen;
+  const r = await post(`/api/stitch/boards/${boardId}/select`,
+    { call_id: callId, role, candidate_id: candidateId });
+  if (myGen !== reqGen) return;
+  if (!r.data.ok) {
+    $("upload-msg").innerHTML = banner("err", esc(r.data.error));
+    return;
+  }
+  board = r.data.board;
+  if (r.data.summary.changed) {
+    invalidateView(`调用 ${callId} 的 ${role === "caller" ? "调用方" : "服务方"}端选定发生变化`);
+  }
+  renderBoard();
+}
+
+$("run").onclick = async () => {
+  const limit = Number(limitEl.value);
+  if (!Number.isInteger(limit) || limit < 0) {
+    $("verdict").innerHTML = banner("err", "<b>输入有误：</b>单程耗时上限必须是非负整数（微秒）。");
+    return;
+  }
+  if (!board.stats.complete_calls) {
+    $("verdict").innerHTML = banner("warn", "尚无两端都已确定的调用，无法分析。");
+    return;
+  }
+  const myGen = ++reqGen;
+  stopPolling();
+  $("detail").innerHTML = "";
+  const r = await post(`/api/stitch/boards/${boardId}/analyze`, { limit_us: limit });
+  if (myGen !== reqGen) return;
+  if (!r.data.ok) {
+    $("verdict").innerHTML = banner("err", esc(r.data.error));
+    return;
+  }
+  board = r.data.board;
+  renderBoard();
+  renderAnalysisState();
+  startPolling(myGen, r.data.job.generation);
+};
+
+function startPolling(myGen, jobGeneration) {
+  stopPolling();
+  pollTimer = setInterval(async () => {
+    if (myGen !== reqGen) { stopPolling(); return; }
+    const r = await fetch(`/api/stitch/boards/${boardId}`);
+    if (!r.ok) { stopPolling(); return; }
+    const data = await r.json();
+    if (myGen !== reqGen) { stopPolling(); return; }
+    board = data.board;
+    renderBoard();
+    const a = board.analysis;
+    // 只接受本次请求对应代次的结果（前端对版，双保险之二）
+    if (a.state === "done" && a.generation === jobGeneration) {
+      stopPolling();
+      renderResult(a);
+    } else {
+      renderAnalysisState();
+    }
+  }, 400);
+}
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+function renderAnalysisState() {
+  const a = board ? board.analysis : null;
+  if (!a || a.state === "idle") {
+    $("run-hint").textContent = "";
+    if (!$("verdict").innerHTML) $("verdict").innerHTML = "";
+    return;
+  }
+  if (a.state === "running") {
+    $("verdict").innerHTML = banner("info",
+      `<b>分析进行中（后台任务 ${esc(a.job_id)}，代次 ${a.generation}）…</b> 若期间记录发生变化，该回包到达后会被直接丢弃。`);
+    $("run-hint").textContent = "等待回包";
+  }
+}
+
+function renderResult(a) {
+  $("run-hint").textContent = `已发布（代次 ${a.generation}，上限 ${a.limit_us} µs）`;
+  if (a.error) {
+    $("verdict").innerHTML = banner("err", `<b>分析失败：</b>${esc(a.error)}`);
+    return;
+  }
+  render(a.result);
+}
+
+function renderBoard() {
+  if (!board) return;
+  $("board-id").textContent = `批次 ID：${board.board_id}｜代次：${board.generation}`;
+  const s = board.stats;
+  $("stats").innerHTML =
+    `<span>调用号 <b>${s.complete_calls}/${s.distinct_calls}</b> 个两端齐全</span>` +
+    `<span>主机 <b>${s.hosts}</b> 台</span><span>已收文件 <b>${s.files}</b> 份</span>` +
+    `<span>规模上限 ${board.limits.max_calls} 笔 / ${board.limits.max_hosts} 台 / ${board.limits.max_files} 份</span>`;
+  $("filelist").innerHTML = board.files.length
+    ? "已收文件：" + board.files.map((f) =>
+        `<li class="mono">${esc(f.name)}（${f.rows} 行，新候选 ${f.new_candidates} 条）</li>`).join("")
+    : "";
+
+  const body = $("board-body");
+  if (!board.calls.length) {
+    body.innerHTML = `<tr><td colspan="4" class="hint">暂无记录，请先上传探针 CSV。</td></tr>`;
+    return;
+  }
+  body.innerHTML = board.calls.map((c) => {
+    const tags = [];
+    if (c.missing_roles.length) {
+      tags.push(`<span class="tag red">缺${c.missing_roles.map((r) => r === "caller" ? "调用方" : "服务方").join("、")}</span>`);
+    }
+    if (c.needs_choice_roles.length) {
+      tags.push(`<span class="tag amber">待重选（${c.needs_choice_roles.map((r) => r === "caller" ? "调用方" : "服务方").join("、")}）</span>`);
+    }
+    if (c.status === "ready") tags.push(`<span class="tag green">两端确定，可分析</span>`);
+    return `<tr>
+      <td class="mono">${esc(c.call_id)}</td>
+      <td>${renderCell(c, "caller")}</td>
+      <td>${renderCell(c, "callee")}</td>
+      <td>${tags.join(" ") || `<span class="tag gray">—</span>`}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderCell(c, role) {
+  const cell = c.roles[role];
+  if (!cell.present) return `<span class="tag red">本端未到</span>`;
+  const auto = cell.candidates.length === 1;
+  const head = auto
+    ? `<span class="tag green">唯一候选，自动采用</span>`
+    : (cell.selected_id
+        ? `<span class="tag green">已选定（来了新候选需重选）</span>`
+        : `<span class="tag amber">${cell.candidates.length} 个候选，请选定</span>`);
+  const items = cell.candidates.map((cd) => {
+    const checked = cd.candidate_id === cell.selected_id ? "checked" : "";
+    return `<div class="cand ${checked ? "sel" : ""}">
+      <label>
+        <input type="radio" name="${esc(c.call_id)}-${role}" ${checked}
+          onchange="choose(${JSON.stringify(c.call_id)},${JSON.stringify(role)},${JSON.stringify(cd.candidate_id)})">
+        <span>
+          <span class="mono">${esc(cd.host)}</span>：
+          请求 <span class="mono">${cd.req_ts}</span> ｜ 应答 <span class="mono">${cd.resp_ts}</span>
+          <div class="src">来源文件：${cd.sources.map(esc).map((x) => `<code>${x}</code>`).join(" ")}</div>
+        </span>
+      </label>
+    </div>`;
+  }).join("");
+  return head + items;
+}
+
+function render(r) {
+  let v = "", d = "";
+  if (!r.consistent) {
+    v = banner("err", `<b>记录彼此矛盾，请复测。</b>以下约束无法同时成立（合计 ${r.contradiction.total_us} µs &lt; 0）：`);
+    d += `<div class="card"><h2>矛盾约束链</h2><ul class="steps">` +
+      r.contradiction.steps.map((s) => `<li class="mono">${esc(s)}</li>`).join("") +
+      `</ul></div>`;
+    $("verdict").innerHTML = v;
+    $("detail").innerHTML = d;
+    return;
+  }
+  if (r.feasible_with_limit) {
+    v = banner("ok", `<b>全部达标：</b>存在一组钟差使所有 ${r.calls.length} 笔调用的去程与回程同时 ≤ 上限 ${r.limit_us} µs。`);
+  } else {
+    v = banner("warn", `<b>无法同时达标：</b>记录自洽，但不存在使所有调用两程同时 ≤ ${r.limit_us} µs 的钟差；` +
+      `能解释这批记录的最小整数上限为 <b>${r.min_limit_us} µs</b>（下表给出一套满足该上限的钟差与逐笔耗时）。`);
+  }
+  d += `<div class="card"><h2>逐笔可达范围（仅基于“钟差固定 + 两程非负”）</h2>`;
+  d += `<table><thead><tr><th>调用号</th><th>方向</th>` +
+    `<th class="num">去程可达范围 (µs)</th><th class="num">回程可达范围 (µs)</th><th>备注</th></tr></thead><tbody>`;
+  for (const c of r.calls) {
+    d += `<tr><td>${esc(c.call_id)}</td><td>${esc(c.caller)} → ${esc(c.callee)}</td>` +
+      `<td class="num">[${c.out_min}, ${c.out_max}]</td>` +
+      `<td class="num">[${c.ret_min}, ${c.ret_max}]</td>` +
+      `<td>${c.must_exceed ? '<span class="tag red">该笔必然超限</span>' : ""}</td></tr>`;
+  }
+  d += `</tbody></table></div>`;
+  d += `<div class="card"><h2>一组可行钟差（${esc(r.assignment_note)}，最小值已归零）</h2>`;
+  d += `<table><thead><tr><th>主机</th><th class="num">相对钟差 o (µs)</th></tr></thead><tbody>`;
+  for (const h of r.hosts) {
+    d += `<tr><td>${esc(h)}</td><td class="num">${r.offsets[h]}</td></tr>`;
+  }
+  d += `</tbody></table><h2 style="margin-top:16px">该组钟差下的逐笔耗时</h2>`;
+  d += `<table><thead><tr><th>调用号</th><th>方向</th>` +
+    `<th class="num">去程 (µs)</th><th class="num">回程 (µs)</th></tr></thead><tbody>`;
+  for (const a of r.assignment) {
+    d += `<tr><td>${esc(a.call_id)}</td><td>${esc(a.caller)} → ${esc(a.callee)}</td>` +
+      `<td class="num">${a.out_us}</td><td class="num">${a.ret_us}</td></tr>`;
+  }
+  d += `</tbody></table></div>`;
+  $("verdict").innerHTML = v;
+  $("detail").innerHTML = d;
+}
+
+(async function init() {
+  await ensureBoard();
+  renderBoard();
+  renderAnalysisState();
+  if (board.analysis.state === "running") startPolling(reqGen, board.analysis.generation);
+  if (board.analysis.state === "done") renderResult(board.analysis);
+})();
+</script>
+</body>
+</html>

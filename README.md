@@ -11,11 +11,25 @@
 - 记录自洽且能同时达标 → 给出满足上限的一组钟差与逐笔两程耗时；
 - 记录自洽但无法同时达标 → 给出**能解释这批记录的最小整数微秒上限**，并按一套满足该上限的钟差列出每笔去/回程耗时。
 
+## RPC 双端日志拼接页（`/stitch`）
+
+真实现场里调用方和服务方探针各自导出本端日志，且可能**分次、分端**上传。拼接页负责在送入上面的单程分析之前把两端记录拼起来：
+
+- 探针 CSV 每行只有本端记录：`call_id,role,host,req_ts,resp_ts`（调用号、本端角色、主机名、本端记录的请求/应答时刻，整数微秒）；
+- 按调用号配对，页面明确标出**还缺哪一端**；
+- 同一端收到内容不同的记录时全部保留为**候选**并标注来源文件，由值班员单选；**该端来了新候选就要重选**，内容完全相同的重传只追加来源、不算新候选；
+- 只有**两端都已确定**的调用才会一起送入单程分析；
+- 用于分析的记录一旦变化（新候选、重选、补录改变了记录集合），**旧结论立即撤下**；后台分析按“代次 + 输入签名”对版，**晚回来的旧回包无法发布**，前端同时丢弃过期响应；
+- 补录若没有改变这批记录（如原样重传），输入签名不变，**原结论照常保留**；
+- 格式有误的文件**整份拒收**，本页已收记录、文件清单和代次都不变。
+
+页面内置 6 个一键演示样例（调用方探针、服务方探针、原样重传、补录、冲突新候选、格式错误）。想直观看到“旧回包晚到被丢弃”，可把 `docker-compose.yml` 里的 `RPC_ANALYSIS_DELAY_MS` 调大（如 800 毫秒）：启动分析后立刻上传冲突样例，旧任务回包到达时会被静默丢弃。
+
 ## 快速开始
 
 ```bash
 docker compose up --build
-# 打开 http://localhost:8000
+# 单程分析页 http://localhost:8000/ ；双端拼接页 http://localhost:8000/stitch
 ```
 
 网页内置两个试算样例（也可直接上传 `samples/` 下的 CSV）：
@@ -28,6 +42,7 @@ docker compose up --build
 ```bash
 pip install -r requirements.txt
 cd app && uvicorn main:app --reload --port 8000
+# 可选：RPC_ANALYSIS_DELAY_MS=800 uvicorn main:app --port 8000  演示回包延迟
 ```
 
 ## CSV 格式
@@ -50,6 +65,26 @@ c1,web1,app1,1000000,1000620,1000700,1000350
 
 容忍 BOM、前导空行与字段两侧空白；四个时刻必须是整数（允许微秒级 Unix 时间戳等大整数）。
 
+## 探针 CSV 格式（拼接页）
+
+表头（列名固定，顺序不限）：
+
+```csv
+call_id,role,host,req_ts,resp_ts
+c1,caller,web1,1000000,1001350
+c1,callee,app1,1000620,1000700
+```
+
+| 列 | 含义 |
+| --- | --- |
+| `call_id` | 调用号，双端按它配对 |
+| `role` | 本端角色：`caller`（调用方）/ `callee`（服务方），也接受中文“调用方/服务方” |
+| `host` | 本端主机名 |
+| `req_ts` | 本端记录的请求时刻（整数微秒）：调用方为请求发出 t1，服务方为请求到达 t2 |
+| `resp_ts` | 本端记录的应答时刻（整数微秒）：服务方为应答发出 t3，调用方为应答到达 t4 |
+
+单文件内完全相同的重复行只算一条；任一行不合法（缺列、非法角色、非整数时刻、空字段、列数不符等）整份拒收。每批最多 80 个调用号、16 台主机、40 份文件。`samples/probe_*.csv` 与页面内嵌演示样例一致（`probe_malformed_example.csv` 供验证拒收）。
+
 ## 方法
 
 设主机 `h` 的钟差为 `o[h]`（本地钟读数 = 真实时刻 + `o[h]`，批内固定）。一笔 `a → b` 的记录给出差分约束：
@@ -66,21 +101,33 @@ c1,web1,app1,1000000,1000620,1000700,1000350
 
 ## API
 
-`POST /api/analyze`，请求体 `{"limit_us": 200, "csv_text": "..."}`。
+单程分析（原有）：`POST /api/analyze`，请求体 `{"limit_us": 200, "csv_text": "..."}`。
 
 - 200 `{"ok": true, "result": {...}}`：`consistent`、`calls`（逐笔范围）、`feasible_with_limit`、`min_limit_us`、`offsets`、`assignment`、`contradiction` 等字段；
 - 400 `{"ok": false, "error": "..."}`：输入或 CSV 校验错误（中文提示，含行号）。
+
+双端拼接（新增，批次为内存态、进程内共享）：
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `POST /api/stitch/boards` | 新建拼接批次，返回批次 ID 与初始状态 |
+| `GET /api/stitch/boards/{id}` | 查询批次完整状态（配对、候选、选择、分析代次与结论） |
+| `POST /api/stitch/boards/{id}/upload` | 上传一份探针 CSV（`filename` + `csv_text`）；先整份校验再入库，400 即整份拒收 |
+| `POST /api/stitch/boards/{id}/select` | 为某调用号的某端选定候选（`call_id`、`role`、`candidate_id`） |
+| `POST /api/stitch/boards/{id}/analyze` | 后台提交单程分析，立即返回 `job_id` 与代次；回包凭代次 + 输入签名对版后才发布 |
 
 另有 `GET /api/health` 健康检查；交互式接口文档见 `/docs`。
 
 ## 目录结构
 
 ```
-app/solver.py        核心算法（纯标准库：解析、差分约束、范围、最小上限）
-app/main.py          FastAPI 入口（页面 + /api/analyze）
-app/static/index.html 单页网页（内嵌试算样例）
-tests/               pytest 测试（test_solver.py 也可直接 python 运行）
-samples/             试算 CSV（与页面内嵌样例一致）
+app/solver.py          核心算法（纯标准库：解析、差分约束、范围、最小上限）
+app/stitch.py          双端拼接（纯标准库：探针解析、候选/选择、输入签名、代次对版）
+app/main.py            FastAPI 入口（两个页面 + /api/analyze + /api/stitch/* 后台任务）
+app/static/index.html  单程分析单页（内嵌试算样例）
+app/static/stitch.html 拼接页（内嵌 6 个演示样例、轮询与前端代次防护）
+tests/                 pytest 测试（test_*.py 也可直接 python 运行）
+samples/               试算 CSV（单程 2 份 + 探针 5 份，与页面内嵌样例一致）
 Dockerfile / docker-compose.yml / requirements.txt
 ```
 
@@ -88,14 +135,15 @@ Dockerfile / docker-compose.yml / requirements.txt
 
 环境：Python 3.11，fastapi 0.165.0，uvicorn 0.54.0（requirements.txt 已按此锁定）。
 
-- `pytest tests/`：**21 个测试全部通过**（解析校验、逐笔范围精确值、达标/不达标判定、最小上限 225 及其边界 224 不可行/225 可行、矛盾负环定位、自调用、非连通主机组、微秒级 Unix 大时间戳、零上限、API 冒烟）。
-- 真实启动 `uvicorn main:app` 后 curl 端到端验证：健康检查、首页 200、样例在 limit=200 时返回 `min_limit_us=225` 且给出的钟差逐笔耗时全部落在 [0,225]（c1 去 225/回 45，c2 去 0/回 200，c3 去 225/回 225，与手算一致）；limit=250 全部达标；矛盾样例返回约束链（合计 −100 µs）；81 笔、17 台主机、非整数时刻、负上限均返回 400 中文错误。
-- 页面内嵌 JS 通过 `node --check` 语法检查；内嵌样例与 `samples/` 文件一致。
-- 本机无 Docker，`docker compose build` 未实际执行；Dockerfile 为标准 python:3.12-slim + pip 安装锁定依赖 + uvicorn 启动，依赖版本与本地实测一致。
+- `pytest tests/`：**52 个测试全部通过**。其中拼接相关 31 个，覆盖：探针解析（BOM/空行/中文角色/文件内去重/各类非法行整份拒收）、按调用号配对与缺端标注、唯一候选自动采用、新候选强制重选、原样重传不产生新候选且代次不变、补录改变输入即撤结论而不改变输入则保留结论、超规模整份拒收、旧代次回包与旧 job 回包均被拒绝发布、无两端齐全调用时拒绝分析、拼接结果与直接 `solver.analyze` 等价；API 测试用 300ms 后台延迟真实复现“分析期间记录变更 → 旧回包晚到被丢弃 → 重选后新回包正常发布”。
+- 真实启动 `uvicorn main:app`（`RPC_ANALYSIS_DELAY_MS=500`）后 curl 端到端演练：双端分次上传 → 缺 c2 服务方被标出 → 坏文件整份拒收（代次/统计不变）→ 原样重传无新候选 → 分析仅含 c1/c3（min_limit=725）→ 分析进行中上传 c1 冲突候选，结论立即撤下、500ms 后旧回包到达被静默拦截（state 仍为 idle、result 为空）→ 重选 v2 + 补录 c2 → 新代次分析含全部 3 笔（min_limit=874，逐笔耗时与所选记录一致）→ 81 调用号超限整份拒收。
+- 原有 21 个单程分析测试保持通过，`/` 与 `/api/analyze` 行为未变；两个页面的内嵌 JS 均通过 `node --check`。
+- 本机无 Docker 守护进程，`docker compose build` 未实际执行；Dockerfile 未改（标准 python:3.12-slim + 锁定依赖 + uvicorn），compose 仅新增可选环境变量 `RPC_ANALYSIS_DELAY_MS`（默认 0）。
 
 ## 待办 / 已知边界
 
 - 模型只假设“钟差固定 + 两程非负”，未校验服务方处理耗时（`resp_send ≥ req_recv`）等额外物理约束；如需更严格的复测提示可再加。
 - 钟差方案不唯一，页面展示的是 Bellman-Ford 求出的一组（最小值归零）；如需“最居中”的方案可在此基础上做线性规划精调。
-- 未做鉴权与请求大小限制，仅限内网可信环境使用；大批量历史追溯、跨窗口钟差漂移建模未覆盖。
+- 拼接批次保存在进程内存（演示用途），重启即清空、未做持久化与鉴权，也没有请求大小限制，仅限内网可信环境；多副本部署需替换为共享存储。
+- 同一 `(call_id, role)` 不限制候选数量，超过页面展示规模时靠每批 80 调用号 / 40 文件的总量约束兜底；跨窗口钟差漂移建模未覆盖。
 - Docker 镜像构建与 compose 启动未在本环境实测（无 Docker 守护进程）。
